@@ -1,2 +1,7 @@
-# net_load_forecasting
-This is the accompanying repository for to my paper: "Day-ahead net load forecasting with self-attention: dealing with meter and meta data unavailability by combining physical and data-driven models"
+# Day-ahead net load forecasting with self-attention
+
+This is the official repository for the paper: ("Day-ahead net load forecasting with self-attention: dealing with meter and
+meta data unavailability by combining physical and data-driven models")[]
+
+
+
