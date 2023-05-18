@@ -6,6 +6,7 @@ from pvlib.location import Location
 from pvlib.modelchain import ModelChain
 from pvlib.temperature import TEMPERATURE_MODEL_PARAMETERS
 import pandas as pd
+import requests
 
 
 '''Utility functions for the project'''
@@ -72,3 +73,15 @@ def reindex_df(df):
     past_dates = pd.date_range(df.index[0], df.index[-1], freq = str(timesteplen) + "T")
     df = df.reindex(past_dates) # keep nan drop it in the end
     return df
+
+
+def get_weather_data(lat, lng, start_date, end_date,variables:list):
+    
+    df_weather = pd.DataFrame()
+    for variable in variables:
+        response = requests.get('https://archive-api.open-meteo.com/v1/archive?latitude={}&longitude={}&start_date={}&end_date={}&hourly={}'.format(lat, lng, start_date, end_date, variable))
+        df = pd.DataFrame(response.json()['hourly'])
+        df = df.set_index('time')
+        df_weather = pd.concat([df_weather, df], axis=1)
+
+    return df_weather
