@@ -59,17 +59,14 @@ def drop_duplicate_index(df, axis=0):
 
 
 def infer_frequency(df):
-    'This function infers the frequency of the time series data and returns it in...'
-    freq = pd.infer_freq(df.index)
-
-    if freq is None:
-        #taking the mode of the difference between the indices
-        freq = df.index.to_series().diff().mode()[0]
+    '''Infers the frequency of a timeseries dataframe and returns the value in minutes'''
+    freq = df.index.to_series().diff().mode()[0].seconds / 60
     return freq
 
 
+
 def reindex_df(df):
-    timesteplen = int(infer_frequency(df) / 60)
+    timesteplen = int(infer_frequency(df))
     past_dates = pd.date_range(df.index[0], df.index[-1], freq = str(timesteplen) + "T")
     df = df.reindex(past_dates) # keep nan drop it in the end
     return df
