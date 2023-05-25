@@ -9,7 +9,8 @@ from pvlib.temperature import TEMPERATURE_MODEL_PARAMETERS
 import pandas as pd
 import requests
 import plotly.express as px
-
+import copy
+from darts.metrics import rmse
 
 '''Utility functions for the project'''
 
@@ -195,3 +196,139 @@ def review_subseries(ts, min_length, ts_cov=None):
             if ts_cov is not None:
                 ts_cov_reviewed.append(ts_cov.slice_intersect(ts))
     return ts_reviewed, ts_cov_reviewed
+
+
+
+
+# Meta data scenarios
+
+def rounder(value:int, interval:int):
+
+    """
+    Rounding the tilt to interval'th degrees.
+    """
+    rounded_value = round(value / interval) * interval
+    
+    return rounded_value
+
+
+def prepare_metadata_per_scenario(df_netload: pd.DataFrame, df_meta:pd.DataFrame, df_irr:pd.DataFrame, meta_data_scenario:str):
+
+    assert meta_data_scenario in ['META-1', 'META-2', 'META-3', 'META-4', 'META-5'], "meta_data_scenario must be one of ['META-1', 'META-2', 'META-3', 'META-4', 'META-5']"
+
+    list_metas = []
+    if meta_data_scenario == 'META-1':
+        # omniscient case
+        df_meta_ = copy.deepcopy(df_meta)
+        list_metas.append(df_meta_)
+    
+    elif meta_data_scenario == 'META-2':
+        # realistic case, the aggregator knows the exact location of the PV system, the tilt and azimuth angle were recorded by the installer (never exact)
+        df_meta_ = copy.deepcopy(df_meta)
+        df_meta_["tilt"] = df_meta_["tilt"].apply(lambda x: rounder(x, 10))
+        df_meta_["azimuth"] = df_meta_["azimuth"].apply(lambda x: rounder(x, 45)) #modifying the azimuth angle based on estimation
+        list_metas.append(df_meta_)
+
+    elif meta_data_scenario == 'META-3':
+        # the aggregator does not know the exact location of the PV system, so he makes a guess for the general area of the energy community
+        df_meta_ = copy.deepcopy(df_meta)
+        df_meta_[['latitude', 'longitude']] = df_meta_[['latitude', 'longitude']].mean()
+        list_metas.append(df_meta_)
+
+    elif meta_data_scenario == 'META-4':
+        # the aggregator does not know the installed dc capacity of the PV systems, so it estimates it from the netload data
+        df_meta_ = copy.deepcopy(df_meta)
+        estimated_ac_capacity = abs(df_netload.min().values[0]) / df_meta.shape[0]  # equally distributed capacity estimated from the netload data
+        df_meta_['estimated_dc_capacity'] = estimated_ac_capacity
+        list_metas.append(df_meta_)
+
+    elif meta_data_scenario == 'META-5':
+        # the tilt and azimuth were not recorded by the installer, so the aggregator makes a guess, same for the location and the installed capacity
+        # will sample random tilts and azimuths from a uniform distribution between 0 and 60 degrees and 0 and 360 degrees respectively, 100 times
+        for i in range(10):
+            df_meta_ = copy.deepcopy(df_meta)
+            random_tilts = np.random.randint(0, 60, (df_meta_.shape[0]))
+            random_azimuths = np.random.randint(0, 360, (df_meta_.shape[0]))
+            df_meta_["tilt"] = random_tilts
+            df_meta_["azimuth"] = random_azimuths
+            df_meta_[['latitude', 'longitude']] = df_meta_[['latitude', 'longitude']].mean()
+            estimated_ac_capacity = abs(df_netload.min().values[0]) / df_meta.shape[0] # equally distributed capacity estimated from the netload data
+            df_meta_['estimated_dc_capacity'] = estimated_ac_capacity
+            list_metas.append(df_meta_)
+
+    return list_metas
+
+
+def pv_generation_forecasts(list_meta_per_scenario, scenarios:list, df_irr):
+    
+    dict_pv_forecasts = {}
+    for meta_scen in scenarios:
+        print(f'Generating PV forecasts for scenario: {meta_scen}')
+        list_meta = list_meta_per_scenario[meta_scen]
+        pv_forecast_per_scenario = []
+        for df_meta in list_meta:
+            df_pv_forecast = df_meta.apply(lambda x: physical_profile(x, df_irr), axis=1).T.sum(axis=1).to_frame('pv_forecast')
+            pv_forecast_per_scenario.append(df_pv_forecast)
+        
+        pv_forecast_per_scenario = pd.concat(pv_forecast_per_scenario, axis=1).mean(axis=1).to_frame(f'pv_forecast_{meta_scen}')
+        dict_pv_forecasts[meta_scen] = pv_forecast_per_scenario
+
+    return dict_pv_forecasts
+
+def get_longest_subseries_idx(ts_list):
+    """
+    Returns the longest subseries from a list of darts TimeSeries objects and its index
+    """
+    longest_subseries_length = 0
+    longest_subseries_idx = 0
+    for idx, ts in enumerate(ts_list):
+        if len(ts) > longest_subseries_length:
+            longest_subseries_length = len(ts)
+            longest_subseries_idx = idx
+    return longest_subseries_idx
+
+
+
+# ML Eval
+
+
+def predict_testset(model, ts, ts_covs, n_lags, n_ahead, eval_stride, pipeline):
+    '''
+    This function predicts the test set using a model and returns the predictions as a dataframe. Used in hyperparameter tuning.
+    '''
+
+    historics = model.historical_forecasts(ts, 
+                                        future_covariates= ts_covs,
+                                        start=ts.get_index_at_point(n_lags),
+                                        verbose=False,
+                                        stride=eval_stride, 
+                                        forecast_horizon=n_ahead, 
+                                        retrain=False, 
+                                        last_points_only=False, # leave this as False unless you want the output to be one series, the rest will not work with this however
+                                        )
+    
+    
+
+    historics_gt = [ts.slice_intersect(historic) for historic in historics]
+    score = np.array(rmse(historics_gt, historics)).mean()
+
+    ts_predictions = ts_list_concat(historics, eval_stride) # concatenating the batches into a single time series for plot 1, this keeps the n_ahead
+    ts_predictions_inverse = pipeline.inverse_transform(ts_predictions) # inverse transform the predictions, we need the original values for the evaluation
+    
+    return ts_predictions_inverse.pd_series().to_frame('prediction'), score
+
+
+
+def ts_list_concat(ts_list, eval_stride):
+    '''
+    This function concatenates a list of time series into one time series.
+    The result is a time series that concatenates the subseries so that n_ahead is preserved.
+    
+    '''
+    ts = ts_list[0]
+    n_ahead = len(ts)
+    skip = n_ahead // eval_stride
+    for i in range(skip, len(ts_list)-skip, skip):
+        ts_1 = ts_list[i][ts.end_time():]
+        ts = ts[:-1].append(ts_1)
+    return ts
