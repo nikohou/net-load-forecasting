@@ -166,3 +166,32 @@ def dropped_days_plotted(df, days_to_drop):
     fig.show()
 
     return df_days_to_drop_full_index
+
+
+def review_subseries(ts, min_length, ts_cov=None):
+    """
+    Reviews a list of timeseries, by checking if it is long enough for the model.
+    If covariate timeseries are provided, it slices them to the same length as the target timeseries.
+    
+    Parameters
+
+    ts: list of dart timeseries
+        The list of timeseries to be reviewed
+    min_length: int
+        The minimum length of the timeseries
+    ts_cov: list of dart timeseries
+        The list of covariate timeseries to be reviewed
+
+    Returns
+
+    ts_reviewed: list of dart timeseries
+
+    """
+    ts_reviewed = [] 
+    ts_cov_reviewed = []
+    for ts in ts:
+        if len(ts) > min_length:
+            ts_reviewed.append(ts)
+            if ts_cov is not None:
+                ts_cov_reviewed.append(ts_cov.slice_intersect(ts))
+    return ts_reviewed, ts_cov_reviewed
