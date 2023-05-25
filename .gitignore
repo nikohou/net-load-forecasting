@@ -1,4 +1,5 @@
 wandb/
 artifacts/
 models/
-data/
+data/clean_data
+data/raw_data
