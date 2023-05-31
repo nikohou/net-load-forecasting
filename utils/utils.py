@@ -292,31 +292,6 @@ def get_longest_subseries_idx(ts_list):
 # ML Eval
 
 
-def predict_testset(model, ts, ts_covs, n_lags, n_ahead, eval_stride, pipeline):
-    '''
-    This function predicts the test set using a model and returns the predictions as a dataframe. Used in hyperparameter tuning.
-    '''
-
-    historics = model.historical_forecasts(ts, 
-                                        future_covariates= ts_covs,
-                                        start=ts.get_index_at_point(n_lags),
-                                        verbose=False,
-                                        stride=eval_stride, 
-                                        forecast_horizon=n_ahead, 
-                                        retrain=False, 
-                                        last_points_only=False, # leave this as False unless you want the output to be one series, the rest will not work with this however
-                                        )
-    
-    
-
-    historics_gt = [ts.slice_intersect(historic) for historic in historics]
-    score = np.array(rmse(historics_gt, historics)).mean()
-
-    ts_predictions = ts_list_concat(historics, eval_stride) # concatenating the batches into a single time series for plot 1, this keeps the n_ahead
-    ts_predictions_inverse = pipeline.inverse_transform(ts_predictions) # inverse transform the predictions, we need the original values for the evaluation
-    
-    return ts_predictions_inverse.pd_series().to_frame('prediction'), score
-
 
 
 def ts_list_concat(ts_list, eval_stride):
@@ -332,3 +307,32 @@ def ts_list_concat(ts_list, eval_stride):
         ts_1 = ts_list[i][ts.end_time():]
         ts = ts[:-1].append(ts_1)
     return ts
+
+
+def predict_testset(config, model, ts, ts_covs, pipeline):
+
+    historics = model.historical_forecasts(ts, 
+                                        future_covariates= ts_covs,
+                                        start=ts.get_index_at_point(config.n_lags),
+                                        verbose=False,
+                                        stride=config.eval_stride, 
+                                        forecast_horizon=config.n_ahead, 
+                                        retrain=False, 
+                                        last_points_only=False, # leave this as False unless you want the output to be one series, the rest will not work with this however
+                                        )
+
+    if config['METER'] == '2':
+        historics = [historic[(config.timesteps_per_hour*24):] for historic in historics] # since in METER 2 we always have to wait 24 hours for the data
+
+    historics_gt = [ts.slice_intersect(historic) for historic in historics]
+    
+    scores = {}
+    for metric in config.eval_metrics:
+        score = np.array(metric(historics_gt, historics)).mean()
+        scores[metric.__name__] = score
+
+    ts_predictions = ts_list_concat(historics, config.eval_stride) # concatenating the batches into a single time series for plot 1, this keeps the n_ahead
+    ts_predictions_inverse = pipeline.inverse_transform(ts_predictions) # inverse transform the predictions, we need the original values for the evaluation
+    
+    return ts_predictions_inverse.pd_series().to_frame('prediction'), scores
+
