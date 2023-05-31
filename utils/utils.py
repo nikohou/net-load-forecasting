@@ -14,38 +14,23 @@ from darts.metrics import rmse
 
 '''Utility functions for the project'''
 
-
-def physical_profile(row, df_irr):
-    idx, latitude, longitude, tilt, azimuth, capacity = row
-
-    temperature_model_parameters = TEMPERATURE_MODEL_PARAMETERS["sapm"][
-        "open_rack_glass_glass"
-    ]
-
-    location = Location(latitude=latitude, longitude=longitude)
-
-    pvwatts_system = PVSystem(
-        surface_tilt=tilt,
-        surface_azimuth=azimuth,
-        module_parameters={"pdc0": capacity, "gamma_pdc": -0.004},
-        inverter_parameters={"pdc0": capacity},
-        temperature_model_parameters=temperature_model_parameters,
-    )
-
-    mc = ModelChain(
-        pvwatts_system, location, aoi_model="physical", spectral_model="no_loss" #these are my model chain assumptions
-    )
-    mc.run_model(df_irr)
-    results = mc.results.ac
-
-    df_results = pd.Series(results)
-    df_results.index = df_results.index.tz_localize(None)
-    df_results.index.name = "timestamp"
-    df_results.name = idx
-
-    return df_results
+# Data collection
 
 
+def get_weather_data(lat, lng, start_date, end_date,variables:list):
+    
+    df_weather = pd.DataFrame()
+    for variable in variables:
+        response = requests.get('https://archive-api.open-meteo.com/v1/archive?latitude={}&longitude={}&start_date={}&end_date={}&hourly={}'.format(lat, lng, start_date, end_date, variable))
+        df = pd.DataFrame(response.json()['hourly'])
+        df = df.set_index('time')
+        df_weather = pd.concat([df_weather, df], axis=1)
+
+    return df_weather
+
+
+
+# Data Prep
 
 def drop_duplicate_index(df, axis=0):
     """
@@ -73,18 +58,6 @@ def reindex_df(df):
     past_dates = pd.date_range(df.index[0], df.index[-1], freq = str(timesteplen) + "T")
     df = df.reindex(past_dates) # keep nan drop it in the end
     return df
-
-
-def get_weather_data(lat, lng, start_date, end_date,variables:list):
-    
-    df_weather = pd.DataFrame()
-    for variable in variables:
-        response = requests.get('https://archive-api.open-meteo.com/v1/archive?latitude={}&longitude={}&start_date={}&end_date={}&hourly={}'.format(lat, lng, start_date, end_date, variable))
-        df = pd.DataFrame(response.json()['hourly'])
-        df = df.set_index('time')
-        df_weather = pd.concat([df_weather, df], axis=1)
-
-    return df_weather
 
 
 
@@ -169,6 +142,8 @@ def dropped_days_plotted(df, days_to_drop):
     return df_days_to_drop_full_index
 
 
+
+
 def review_subseries(ts, min_length, ts_cov=None):
     """
     Reviews a list of timeseries, by checking if it is long enough for the model.
@@ -201,6 +176,59 @@ def review_subseries(ts, min_length, ts_cov=None):
 
 
 # Meta data scenarios
+
+def physical_profile(row, df_irr):
+
+    """
+
+    This function generates the PV generation profile for a single PV system.
+
+    Parameters
+
+    row: pd.Series
+        A row of the meta data dataframe
+    df_irr: pd.DataFrame
+        The irradiance data with ghi, dni and dhi and temperature
+
+    Returns
+
+    df_results: pd.Series
+        The PV generation profile
+
+    """
+
+
+
+    idx, latitude, longitude, tilt, azimuth, capacity = row
+
+    temperature_model_parameters = TEMPERATURE_MODEL_PARAMETERS["sapm"][
+        "open_rack_glass_glass"
+    ]
+
+    location = Location(latitude=latitude, longitude=longitude)
+
+    pvwatts_system = PVSystem(
+        surface_tilt=tilt,
+        surface_azimuth=azimuth,
+        module_parameters={"pdc0": capacity, "gamma_pdc": -0.004},
+        inverter_parameters={"pdc0": capacity},
+        temperature_model_parameters=temperature_model_parameters,
+    )
+
+    mc = ModelChain(
+        pvwatts_system, location, aoi_model="physical", spectral_model="no_loss" #these are my model chain assumptions
+    )
+    mc.run_model(df_irr)
+    results = mc.results.ac
+
+    df_results = pd.Series(results)
+    df_results.index = df_results.index.tz_localize(None)
+    df_results.index.name = "timestamp"
+    df_results.name = idx
+
+    return df_results
+
+
 
 def rounder(value:int, interval:int):
 
@@ -260,6 +288,26 @@ def prepare_metadata_per_scenario(df_netload: pd.DataFrame, df_meta:pd.DataFrame
 
 
 def pv_generation_forecasts(list_meta_per_scenario, scenarios:list, df_irr):
+
+    """
+
+    This function generates the PV generation forecasts for the different meta data scenarios.
+
+    Parameters
+
+    list_meta_per_scenario: list of pd.DataFrames
+        The list of meta data per scenario
+    scenarios: list of str
+        The list of scenarios to generate the forecasts for
+    df_irr: pd.DataFrame
+        The irradiance data
+
+    Returns
+
+    dict_pv_forecasts: dict
+        A dictionary with the PV generation forecasts per scenario
+
+    """
     
     dict_pv_forecasts = {}
     for meta_scen in scenarios:
@@ -275,38 +323,96 @@ def pv_generation_forecasts(list_meta_per_scenario, scenarios:list, df_irr):
 
     return dict_pv_forecasts
 
-def get_longest_subseries_idx(ts_list):
-    """
-    Returns the longest subseries from a list of darts TimeSeries objects and its index
-    """
-    longest_subseries_length = 0
-    longest_subseries_idx = 0
-    for idx, ts in enumerate(ts_list):
-        if len(ts) > longest_subseries_length:
-            longest_subseries_length = len(ts)
-            longest_subseries_idx = idx
-    return longest_subseries_idx
 
 
-
-# ML Eval
-
+# Model training
 
 
+class Config:
 
-def ts_list_concat(ts_list, eval_stride):
     '''
-    This function concatenates a list of time series into one time series.
-    The result is a time series that concatenates the subseries so that n_ahead is preserved.
+    
+    Class to store config parameters, to circumvent the wandb.config when combining multiple models.
     
     '''
-    ts = ts_list[0]
-    n_ahead = len(ts)
-    skip = n_ahead // eval_stride
-    for i in range(skip, len(ts_list)-skip, skip):
-        ts_1 = ts_list[i][ts.end_time():]
-        ts = ts[:-1].append(ts_1)
-    return ts
+
+    def __init__(self):
+        self.data = {}
+
+    def __getattr__(self, key):
+        if key in self.data:
+            return self.data[key]
+        else:
+            raise AttributeError(f"'Config' object has no attribute '{key}'")
+
+    def __setattr__(self, key, value):
+        if key == 'data':
+            # Allow normal assignment for the 'data' attribute
+            super().__setattr__(key, value)
+        else:
+            self.data[key] = value
+
+    def __delattr__(self, key):
+        if key in self.data:
+            del self.data[key]
+        else:
+            raise AttributeError(f"'Config' object has no attribute '{key}'")
+
+    def __len__(self):
+        return len(self.data)
+
+    def keys(self):
+        return self.data.keys()
+
+    def values(self):
+        return self.data.values()
+
+    def items(self):
+        return self.data.items()
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def __setitem__(self, key, value):
+        self.data[key] = value
+
+    @classmethod
+    def from_dict(cls, data):
+        config = cls()
+        for key, value in data.items():
+            if isinstance(value, dict):
+                value = cls.from_dict(value)  # Recursively convert nested dictionaries
+            setattr(config, key, value)
+        return config
+
+
+
+def build_config(config_dataset):
+
+    '''
+    
+    Takes a config_dataset dictionary and builds a config object from it, deriving the rest of the parameters from the config_dataset.
+
+    '''
+
+    config = Config().from_dict(config_dataset)
+    config.temp_resolution = 15 # in minutes
+    config.horizon_in_hours = 24 + 36 if config.METER == '2' else 36 # in hours, 24 for the data gap in METER-2 and 36 for the day-ahead forecast horizon
+
+    config.timestep_encoding = ["hour", "minute"] if config.temp_resolution == 1 else ['quarter']
+    config.datetime_encoding =  {
+                        "cyclic": {"future": config.timestep_encoding}, 
+                        "position": {"future": ["relative",]},
+                        "datetime_attribute": {"future": ["dayofweek", "week"]},
+                        'position': {'future': ['relative']},
+                } if config.use_datetime_encoding else None
+
+    config.timesteps_per_hour = int(60 / config.temp_resolution)
+    config.n_lags = config.lookback_in_hours * config.timesteps_per_hour
+    config.n_ahead = config.horizon_in_hours * config.timesteps_per_hour
+    config.eval_stride = int(np.sqrt(config.n_ahead)) # evaluation stride, how often to evaluate the model, in this case we evaluate every n_ahead steps
+    
+    return config
 
 
 def predict_testset(config, model, ts, ts_covs, pipeline):
@@ -335,4 +441,37 @@ def predict_testset(config, model, ts, ts_covs, pipeline):
     ts_predictions_inverse = pipeline.inverse_transform(ts_predictions) # inverse transform the predictions, we need the original values for the evaluation
     
     return ts_predictions_inverse.pd_series().to_frame('prediction'), scores
+
+
+
+
+# ML Eval
+
+def get_longest_subseries_idx(ts_list):
+    """
+    Returns the longest subseries from a list of darts TimeSeries objects and its index
+    """
+    longest_subseries_length = 0
+    longest_subseries_idx = 0
+    for idx, ts in enumerate(ts_list):
+        if len(ts) > longest_subseries_length:
+            longest_subseries_length = len(ts)
+            longest_subseries_idx = idx
+    return longest_subseries_idx
+
+
+def ts_list_concat(ts_list, eval_stride):
+    '''
+    This function concatenates a list of time series into one time series.
+    The result is a time series that concatenates the subseries so that n_ahead is preserved.
+    
+    '''
+    ts = ts_list[0]
+    n_ahead = len(ts)
+    skip = n_ahead // eval_stride
+    for i in range(skip, len(ts_list)-skip, skip):
+        ts_1 = ts_list[i][ts.end_time():]
+        ts = ts[:-1].append(ts_1)
+    return ts
+
 
