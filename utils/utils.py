@@ -398,7 +398,6 @@ def build_config(config_dataset):
     config = Config().from_dict(config_dataset)
     config.temp_resolution = 15 # in minutes
     config.horizon_in_hours = 24 + 36 if config.METER == '2' else 36 # in hours, 24 for the data gap in METER-2 and 36 for the day-ahead forecast horizon
-
     config.timestep_encoding = ["hour", "minute"] if config.temp_resolution == 1 else ['quarter']
     config.datetime_encoding =  {
                         "cyclic": {"future": config.timestep_encoding}, 
@@ -427,10 +426,15 @@ def predict_testset(config, model, ts, ts_covs, pipeline):
                                         last_points_only=False, # leave this as False unless you want the output to be one series, the rest will not work with this however
                                         )
 
+    historics = [pipeline.inverse_transform(historic) for historic in historics]
+
     if config['METER'] == '2':
         historics = [historic[(config.timesteps_per_hour*24):] for historic in historics] # since in METER 2 we always have to wait 24 hours for the data
 
-    historics_gt = [ts.slice_intersect(historic) for historic in historics]
+    
+    gt_inverse_transformed = pipeline.inverse_transform(ts)
+
+    historics_gt = [gt_inverse_transformed.slice_intersect(historic) for historic in historics]
     
     scores = {}
     for metric in config.eval_metrics:
@@ -438,10 +442,8 @@ def predict_testset(config, model, ts, ts_covs, pipeline):
         scores[metric.__name__] = score
 
     ts_predictions = ts_list_concat(historics, config.eval_stride) # concatenating the batches into a single time series for plot 1, this keeps the n_ahead
-    ts_predictions_inverse = pipeline.inverse_transform(ts_predictions) # inverse transform the predictions, we need the original values for the evaluation
-    
-    return ts_predictions_inverse.pd_series().to_frame('prediction'), scores
 
+    return ts_predictions.pd_series().to_frame('prediction'), scores
 
 
 
@@ -471,7 +473,6 @@ def ts_list_concat(ts_list, eval_stride):
     skip = n_ahead // eval_stride
     for i in range(skip, len(ts_list)-skip, skip):
         ts_1 = ts_list[i][ts.end_time():]
-        ts = ts[:-1].append(ts_1)
+        timestamp_one_before = ts_1.start_time() - ts.freq
+        ts = ts[:timestamp_one_before].append(ts_1)
     return ts
-
-
