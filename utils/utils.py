@@ -397,7 +397,7 @@ def build_config(config_dataset):
 
     config = Config().from_dict(config_dataset)
     config.temp_resolution = 15 # in minutes
-    config.horizon_in_hours = 24 + 36 if config.METER == '2' else 36 # in hours, 24 for the data gap in METER-2 and 36 for the day-ahead forecast horizon
+    config.horizon_in_hours = 24 + 36 if config.METER == '2' else 4 # in hours, 24 for the data gap in METER-2 and 36 for the day-ahead forecast horizon
     config.timestep_encoding = ["hour", "minute"] if config.temp_resolution == 1 else ['quarter']
     config.datetime_encoding =  {
                         "cyclic": {"future": config.timestep_encoding}, 
@@ -431,11 +431,12 @@ def predict_testset(config, model, ts, ts_covs, pipeline):
     if config['METER'] == '2':
         historics = [historic[(config.timesteps_per_hour*24):] for historic in historics] # since in METER 2 we always have to wait 24 hours for the data
 
-    
+
     gt_inverse_transformed = pipeline.inverse_transform(ts)
 
     historics_gt = [gt_inverse_transformed.slice_intersect(historic) for historic in historics]
     
+
     scores = {}
     for metric in config.eval_metrics:
         score = np.array(metric(historics_gt, historics)).mean()
