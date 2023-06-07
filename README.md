@@ -31,6 +31,15 @@ The energy transition is under way and roof-top solar photovoltaics (PV) have th
 
 <p align="center"><strong>Figure 2:</strong> Combination of PVWatts Physical Model and Data-Driven Transformer Neural Network.</p>
 
+### Results
+
+<p align="center">
+  <img src="imgs/figures/train_ratio_imbalance_costs.png" alt="result_imb" width="500">
+</p>
+
+<p align="center"><strong>Figure 2:</strong> Imbalance Costs vs. Training Data Ratio: Comparing Additive (ours) with Direct & Integrated Model.</p>
+
+
 
 
 
