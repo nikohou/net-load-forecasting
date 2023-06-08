@@ -37,7 +37,7 @@ The energy transition is under way and roof-top solar photovoltaics (PV) have th
   <img src="imgs/figures/train_ratio_imbalance_costs.png" alt="result_imb" width="500">
 </p>
 
-<p align="center"><strong>Figure 2:</strong> Imbalance Costs vs. Training Data Ratio: Comparing Additive (ours) with Direct & Integrated Model.</p>
+<p align="center"><strong>Figure 4:</strong> Imbalance Costs vs. Training Data Ratio: Comparing Additive (ours) with Direct & Integrated Model.</p>
 
 
 
@@ -45,7 +45,24 @@ The energy transition is under way and roof-top solar photovoltaics (PV) have th
   <img src="imgs/figures/train_ratio_rmse_skill.png" alt="result_imb" width="500">
 </p>
 
-<p align="center"><strong>Figure 2:</strong> RMSE Skill Score (w.r.t. 24h persistence) vs. Training Data Ratio: Comparing Additive (ours) with Direct & Integrated Model.</p>
+<p align="center"><strong>Figure 4:</strong> RMSE Skill Score (w.r.t. 24h persistence) vs. Training Data Ratio: Comparing Additive (ours) with Direct & Integrated Model.</p>
+
+
+<div style="overflow: auto;">
+  <div style="float: left; margin-right: 20px;">
+    <p align="center">
+      <img src="imgs/figures/train_ratio_imbalance_costs.png" alt="result_imb" width="500">
+    </p>
+    <p align="center"><strong>Figure 4:</strong> Imbalance Costs vs. Training Data Ratio: Comparing Additive (ours) with Direct & Integrated Model.</p>
+  </div>
+
+  <div style="float: left;">
+    <p align="center">
+      <img src="imgs/figures/train_ratio_rmse_skill.png" alt="result_imb" width="500">
+    </p>
+    <p align="center"><strong>Figure 4:</strong> RMSE Skill Score (w.r.t. 24h persistence) vs. Training Data Ratio: Comparing Additive (ours) with Direct & Integrated Model.</p>
+  </div>
+</div>
 
 
 
