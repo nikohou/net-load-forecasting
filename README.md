@@ -4,7 +4,7 @@
 This is the official repository for the paper: ["Day-ahead net load forecasting with self-attention: dealing with meter and
 meta data unavailability by combining physical and data-driven models"] (✔️ Accepted to [International Energy Workshop](https://www.internationalenergyworkshop.org/meetings-16.html))
 
-The paper will be released once presented at the conference.
+The paper & slides will be released here once presented at the conference.
 
 ## Summary
 
