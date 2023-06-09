@@ -1,6 +1,17 @@
+<div align="center">
+
 # Day-ahead net load forecasting with self-attention
 [![](https://raw.githubusercontent.com/wandb/assets/main/wandb-github-badge-gradient.svg)](https://wandb.ai/wattcast/net-load-forecasting?workspace=user-nikolaushouben)
 
+  [![python](https://img.shields.io/badge/-Python_3.8_%7C_3.9_%7C_3.10-blue?logo=python&logoColor=white)](https://github.com/pre-commit/pre-commit)
+[![pytorch](https://img.shields.io/badge/PyTorch_2.0+-ee4c2c?logo=pytorch&logoColor=white)](https://pytorch.org/get-started/locally/)
+[![lightning](https://img.shields.io/badge/-Lightning_2.0+-792ee5?logo=pytorchlightning&logoColor=white)](https://pytorchlightning.ai/)
+[![hydra](https://img.shields.io/badge/Config-Hydra_1.3-89b8cd)](https://hydra.cc/) 
+[![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/gitbooo/TSF_context_Eumetsat/blob/neurips_2023/README.md#license)
+ 
+ </div>
+
+  
 This is the official repository for the paper: ["Day-ahead net load forecasting with self-attention: dealing with meter and
 meta data unavailability by combining physical and data-driven models"] (✔️ Accepted to [International Energy Workshop](https://www.internationalenergyworkshop.org/meetings-16.html))
 
