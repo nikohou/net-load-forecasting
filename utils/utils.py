@@ -155,8 +155,8 @@ def review_subseries(ts, min_length, ts_cov=None):
         The list of timeseries to be reviewed
     min_length: int
         The minimum length of the timeseries
-    ts_cov: list of dart timeseries
-        The list of covariate timeseries to be reviewed
+    ts_cov:dart timeseries
+        Covariate timeseries to be reviewed
 
     Returns
 
@@ -165,11 +165,11 @@ def review_subseries(ts, min_length, ts_cov=None):
     """
     ts_reviewed = [] 
     ts_cov_reviewed = []
-    for ts in ts:
-        if len(ts) > min_length:
-            ts_reviewed.append(ts)
+    for ts_ in ts:
+        if len(ts_) > min_length:
+            ts_reviewed.append(ts_)
             if ts_cov is not None:
-                ts_cov_reviewed.append(ts_cov.slice_intersect(ts))
+                ts_cov_reviewed.append(ts_cov.slice_intersect(ts_))
     return ts_reviewed, ts_cov_reviewed
 
 
