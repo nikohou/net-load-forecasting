@@ -5,18 +5,21 @@
 from abc import ABC, abstractmethod
 import pandas as pd
 import numpy as np
+import cvxpy as cp
 
 
-class Battery:
-    def __init__(self, cap, c_rate, timestep_sec=60):
-        self.capacity = np.array(cap)
+class BatteryFleet:
+    """A fleet of batteries with the same specifications."""
+
+    def __init__(self, cap, c_rate, soc_inits, timestep_sec):
+        self.capacities = np.array(cap).astype(float)
         self.timestep_sec = timestep_sec
-        self.c_rate = 1
-        self.max_power = self.capacity * self.c_rate
-        self.energy = 0.0 * self.capacity
+        self.c_rates = np.array(c_rate).astype(float)
+        self.max_powers = self.capacities * self.c_rates
+        self.energies = soc_inits * self.capacities  # initialize at 50% capacity
 
         print(
-            f"Initialized batteries with capacities: {self.capacity}, max power: {self.max_power}, energies: {self.energy}"
+            f"Initialized batteries with capacities: {self.capacities}, max power: {self.max_powers}, energies: {self.energies}"
         )
 
     def update(self, powers):
@@ -28,9 +31,9 @@ class Battery:
         3. if the energy level is above the capacity, set it to the capacity, if it is below 0, set it to 0
         """
 
-        powers = np.clip(powers, -self.max_power, self.max_power)
-        self.energy += powers * self.timestep_sec / 3600
-        self.energy = np.clip(self.energy, 0, self.capacity)
+        powers = np.clip(powers, -1 * self.max_powers, self.max_powers)
+        self.energies += powers * self.timestep_sec / 3600
+        self.energies = np.clip(self.energies, 0, self.capacities)
 
 
 class Controller(ABC):
@@ -41,7 +44,7 @@ class Controller(ABC):
         """
         self.df_loads = df_loads.values
         self.df_pvs = df_pvs.values
-        self.bess = Battery(
+        self.bess = BatteryFleet(
             [bess_cap] * len(df_loads.columns),
             c_rate,
             timestep_sec=df_loads.index.freq.delta.seconds,
