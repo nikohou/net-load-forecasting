@@ -16,10 +16,7 @@
         "titleBar.activeBackground": "#eb9923",
         "titleBar.activeForeground": "#15202b",
         "titleBar.inactiveBackground": "#eb992399",
-        "titleBar.inactiveForeground": "#15202b99",
-        "editorGroup.border": "#efaf52",
-        "statusBar.debuggingBackground": "#2375eb",
-        "statusBar.debuggingForeground": "#e7e7e7"
+        "titleBar.inactiveForeground": "#15202b99"
     },
     "peacock.color": "eb9923",
     "python.analysis.typeCheckingMode": "basic"

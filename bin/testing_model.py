@@ -1,170 +1,380 @@
-import os
-import darts
-from darts import TimeSeries
-
-from darts.models import NLinearModel
-import pandas as pd
-import numpy as np
-
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 
-from darts.logging import raise_if
+from darts.logging import get_logger, raise_log
 from darts.models.forecasting.pl_forecasting_module import (
-    PLForecastingModule,
     PLMixedCovariatesModule,
+    io_processor,
 )
 from darts.models.forecasting.torch_forecasting_model import MixedCovariatesTorchModel
-from abc import ABC, abstractmethod
+from darts.utils.torch import MonteCarloDropout
+import os
+
+from bin.hems import HomeEnergyManager
+
+MixedCovariatesTrainTensorType = Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]
+
+
+logger = get_logger(__name__)
+
 
 ROOT_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-class Module(PLMixedCovariatesModule):
-    """
-    Netload module
-    """
-
+class _ResidualBlock(nn.Module):
     def __init__(
         self,
-        input_dim,
-        output_dim,
-        future_cov_dim,
-        static_cov_dim,
-        nr_params,
-        shared_weights,
-        const_init,
-        normalize,
+        input_dim: int,
+        output_dim: int,
+        hidden_size: int,
+        dropout: float,
+        use_layer_norm: bool,
+    ):
+        """Pytorch module implementing the Residual Block from the TiDE paper."""
+        super().__init__()
+
+        # dense layer with ReLU activation with dropout
+        self.dense = nn.Sequential(
+            nn.Linear(input_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, output_dim),
+            MonteCarloDropout(dropout),
+        )
+
+        # linear skip connection from input to output of self.dense
+        self.skip = nn.Linear(input_dim, output_dim)
+
+        # layer normalization as output
+        if use_layer_norm:
+            self.layer_norm = nn.LayerNorm(output_dim)
+        else:
+            self.layer_norm = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # residual connection
+        x = self.dense(x) + self.skip(x)
+
+        # layer normalization
+        if self.layer_norm is not None:
+            x = self.layer_norm(x)
+
+        return x
+
+
+class Module(PLMixedCovariatesModule):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        future_cov_dim: int,
+        static_cov_dim: int,
+        nr_params: int,
+        num_encoder_layers: int,
+        num_decoder_layers: int,
+        decoder_output_dim: int,
+        hidden_size: int,
+        temporal_decoder_hidden: int,
+        temporal_width_past: int,
+        temporal_width_future: int,
+        use_layer_norm: bool,
+        dropout: float,
+        hem_layer: HomeEnergyManager,
         **kwargs,
     ):
-        """PyTorch module implementing the N-HiTS architecture.
+        """Pytorch module implementing the TiDE architecture.
 
         Parameters
         ----------
         input_dim
-            The number of input components (target + optional covariate)
+            The number of input components (target + optional past covariates + optional future covariates).
         output_dim
-            Number of output components in the target
+            Number of output components in the target.
         future_cov_dim
-            Number of components in the future covariates
+            Number of future covariates.
         static_cov_dim
-            Dimensionality of the static covariates
+            Number of static covariates.
         nr_params
             The number of parameters of the likelihood (or 1 if no likelihood is used).
-        shared_weights
-            Whether to use shared weights for the components of the series.
-            ** Ignores covariates when True. **
-        normalize
-            Whether to apply the "normalization" described in the paper.
-        const_init
-            Whether to initialize the weights to 1/in_len
-
+        num_encoder_layers
+            Number of stacked Residual Blocks in the encoder.
+        num_decoder_layers
+            Number of stacked Residual Blocks in the decoder.
+        decoder_output_dim
+            The number of output components of the decoder.
+        hidden_size
+            The width of the hidden layers in the encoder/decoder Residual Blocks.
+        temporal_decoder_hidden
+            The width of the hidden layers in the temporal decoder.
+        temporal_width_past
+            The width of the past covariate embedding space.
+        temporal_width_future
+            The width of the future covariate embedding space.
+        use_layer_norm
+            Whether to use layer normalization in the Residual Blocks.
+        dropout
+            Dropout probability
         **kwargs
-            all parameters required for :class:`darts.model.forecasting_models.PLForecastingModule` base class.
+            all parameters required for :class:`darts.models.forecasting.pl_forecasting_module.PLForecastingModule`
+            base class.
 
         Inputs
         ------
-        x of shape `(batch_size, input_chunk_length)`
-            Tensor containing the input sequence.
-
+        x
+            Tuple of Tensors `(x_past, x_future, x_static)` where `x_past` is the input/past chunk and
+            `x_future`is the output/future chunk. Input dimensions are `(batch_size, time_steps, components)`
         Outputs
         -------
-        y of shape `(batch_size, output_chunk_length, target_size/output_dim, nr_params)`
-            Tensor containing the output of the NBEATS module.
+        y
+            Tensor of shape `(batch_size, output_chunk_length, output_dim, nr_params)`
 
         """
+
         super().__init__(**kwargs)
+
         self.input_dim = input_dim
         self.output_dim = output_dim
+        self.past_cov_dim = input_dim - output_dim - future_cov_dim
         self.future_cov_dim = future_cov_dim
         self.static_cov_dim = static_cov_dim
         self.nr_params = nr_params
-        self.shared_weights = shared_weights
-        self.const_init = const_init
-        self.normalize = normalize
-        self.mode = "additive"
+        self.num_encoder_layers = num_encoder_layers
+        self.num_decoder_layers = num_decoder_layers
+        self.decoder_output_dim = decoder_output_dim
+        self.hidden_size = hidden_size
+        self.temporal_decoder_hidden = temporal_decoder_hidden
+        self.use_layer_norm = use_layer_norm
+        self.dropout = dropout
+        self.temporal_width_past = temporal_width_past
+        self.temporal_width_future = temporal_width_future
+        self.hem_layer = hem_layer
 
-        def _create_linear_layer(in_dim, out_dim):
-            layer = nn.Linear(in_dim, out_dim)
-            if self.const_init:
-                layer.weight = nn.Parameter(
-                    (1.0 / in_dim) * torch.ones(layer.weight.shape)
+        # past covariates handling: either feature projection, raw features, or no features
+        self.past_cov_projection = None
+        if self.past_cov_dim and temporal_width_past:
+            # residual block for past covariates feature projection
+            self.past_cov_projection = _ResidualBlock(
+                input_dim=self.past_cov_dim,
+                output_dim=temporal_width_past,
+                hidden_size=hidden_size,
+                use_layer_norm=use_layer_norm,
+                dropout=dropout,
+            )
+            past_covariates_flat_dim = self.input_chunk_length * temporal_width_past
+        elif self.past_cov_dim:
+            # skip projection and use raw features
+            past_covariates_flat_dim = self.input_chunk_length * self.past_cov_dim
+        else:
+            past_covariates_flat_dim = 0
+
+        # future covariates handling: either feature projection, raw features, or no features
+        self.future_cov_projection = None
+        if future_cov_dim and self.temporal_width_future:
+            # residual block for future covariates feature projection
+            self.future_cov_projection = _ResidualBlock(
+                input_dim=future_cov_dim,
+                output_dim=temporal_width_future,
+                hidden_size=hidden_size,
+                use_layer_norm=use_layer_norm,
+                dropout=dropout,
+            )
+            historical_future_covariates_flat_dim = (
+                self.input_chunk_length + self.output_chunk_length
+            ) * temporal_width_future
+        elif future_cov_dim:
+            # skip projection and use raw features
+            historical_future_covariates_flat_dim = (
+                self.input_chunk_length + self.output_chunk_length
+            ) * future_cov_dim
+        else:
+            historical_future_covariates_flat_dim = 0
+
+        encoder_dim = (
+            self.input_chunk_length * output_dim
+            + past_covariates_flat_dim
+            + historical_future_covariates_flat_dim
+            + static_cov_dim
+        )
+
+        self.encoders = nn.Sequential(
+            _ResidualBlock(
+                input_dim=encoder_dim,
+                output_dim=hidden_size,
+                hidden_size=hidden_size,
+                use_layer_norm=use_layer_norm,
+                dropout=dropout,
+            ),
+            *[
+                _ResidualBlock(
+                    input_dim=hidden_size,
+                    output_dim=hidden_size,
+                    hidden_size=hidden_size,
+                    use_layer_norm=use_layer_norm,
+                    dropout=dropout,
                 )
-            return layer
+                for _ in range(num_encoder_layers - 1)
+            ],
+        )
 
-        layer_in_dim = self.input_chunk_length * (self.input_dim - self.future_cov_dim)
-        layer_out_dim = self.output_chunk_length * self.output_dim * self.nr_params
+        self.decoders = nn.Sequential(
+            *[
+                _ResidualBlock(
+                    input_dim=hidden_size,
+                    output_dim=hidden_size,
+                    hidden_size=hidden_size,
+                    use_layer_norm=use_layer_norm,
+                    dropout=dropout,
+                )
+                for _ in range(num_decoder_layers - 1)
+            ],
+            # add decoder output layer
+            _ResidualBlock(
+                input_dim=hidden_size,
+                output_dim=decoder_output_dim
+                * self.output_chunk_length
+                * self.nr_params,
+                hidden_size=hidden_size,
+                use_layer_norm=use_layer_norm,
+                dropout=dropout,
+            ),
+        )
 
-        # for static cov, we take the number of components of the target, times static cov dim
-        layer_in_dim_static_cov = self.output_dim * self.static_cov_dim
+        decoder_input_dim = decoder_output_dim * self.nr_params
+        if temporal_width_future and future_cov_dim:
+            decoder_input_dim += temporal_width_future
+        elif future_cov_dim:
+            decoder_input_dim += future_cov_dim
 
-        self.layer = _create_linear_layer(layer_in_dim, layer_out_dim)
+        self.temporal_decoder = _ResidualBlock(
+            input_dim=decoder_input_dim,
+            output_dim=output_dim * self.nr_params,
+            hidden_size=temporal_decoder_hidden,
+            use_layer_norm=use_layer_norm,
+            dropout=dropout,
+        )
 
-        if self.future_cov_dim != 0:
-            # future covariates layer acts on time steps independently
-            self.linear_fut_cov = _create_linear_layer(
-                self.future_cov_dim, self.output_dim * self.nr_params
-            )
-        if self.static_cov_dim != 0:
-            self.linear_static_cov = _create_linear_layer(
-                layer_in_dim_static_cov, layer_out_dim
-            )
+        self.lookback_skip = nn.Linear(
+            self.input_chunk_length,
+            self.output_chunk_length * self.nr_params,  # type: ignore
+        )
 
+    @io_processor
     def forward(
         self, x_in: Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
-    ):
-        """
+    ) -> torch.Tensor:
+        """TiDE model forward pass.
+        Parameters
+        ----------
         x_in
             comes as tuple `(x_past, x_future, x_static)` where `x_past` is the input/past chunk and `x_future`
-            is the output/future chunk. Input dimensions are `(n_samples, n_time_steps, n_variables)`
+            is the output/future chunk. Input dimensions are `(batch_size, time_steps, components)`
+        Returns
+        -------
+        torch.Tensor
+            The output Tensor of shape `(batch_size, output_chunk_length, output_dim, nr_params)`
         """
-        x, x_future, x_static = x_in
-        N, L, C = x.shape  # x: (batch, in_len, in_dim)
 
-        x_netload = x[:, :, : -self.future_cov_dim]
-        x_pv = x[:, :, -self.future_cov_dim :]
+        # x has shape (batch_size, input_chunk_length, input_dim)
+        # x_future_covariates has shape (batch_size, input_chunk_length, future_cov_dim)
+        # x_static_covariates has shape (batch_size, static_cov_dim)
+        x, x_future_covariates, x_static_covariates = x_in
 
-        if self.mode == "additive":
-            x_load = x_netload - x_pv
-        elif self.mode == "rnn":
-            pass
+        x_lookback = x[:, :, : self.output_dim]
 
-        if self.normalize:
-            seq_last = x_load[:, -1:, :].detach()  # (batch, 1, in_dim)
-            x_load = x_load - seq_last
-
-        x_load = self.layer(
-            x_load.view(N, -1)
-        )  # (batch, out_len * out_dim * nr_params)
-        x_load = x_load.view(
-            N, self.output_chunk_length, self.output_dim * self.nr_params
-        )
-
-        if self.normalize:
-            x_load = x_load + seq_last  # Note: works only when nr_params == 1
-
-        if self.future_cov_dim != 0:
-            # x_future might be shorter than output_chunk_length when n < output_chunk_length
-            # so we need to pad it with zeros at the end to match the output_chunk_length
-            x_future = torch.nn.functional.pad(
-                input=x_future,
-                pad=(0, 0, 0, self.output_chunk_length - x_future.shape[1]),
-                mode="constant",
-                value=0,
+        # future covariates: feature projection or raw features
+        # historical future covariates need to be extracted from x and stacked with part of future covariates
+        if self.future_cov_dim:
+            x_dynamic_future_covariates = torch.cat(
+                [
+                    x[
+                        :,
+                        :,
+                        None if self.future_cov_dim == 0 else -self.future_cov_dim :,
+                    ],
+                    x_future_covariates,
+                ],
+                dim=1,
             )
+            if self.temporal_width_future:
+                # project input features across all input and output time steps
+                x_dynamic_future_covariates = self.future_cov_projection(
+                    x_dynamic_future_covariates
+                )  # type: ignore
+        else:
+            x_dynamic_future_covariates = None
 
-            fut_cov_output = self.linear_fut_cov(x_future)
-            x_load = x_load + fut_cov_output.view(
-                N, self.output_chunk_length, self.output_dim * self.nr_params
-            )
+        # past covariates: feature projection or raw features
+        # the past covariates are embedded in `x`
+        if self.past_cov_dim:
+            x_dynamic_past_covariates = x[
+                :,
+                :,
+                self.output_dim : self.output_dim + self.past_cov_dim,
+            ]
+            if self.temporal_width_past:
+                # project input features across all input time steps
+                x_dynamic_past_covariates = self.past_cov_projection(
+                    x_dynamic_past_covariates
+                )  # type: ignore
+        else:
+            x_dynamic_past_covariates = None
 
-        x_load = x_load.view(
-            N, self.output_chunk_length, self.output_dim, self.nr_params
-        )
+        # setup input to encoder
+        encoded = [
+            x_lookback,
+            x_dynamic_past_covariates,
+            x_dynamic_future_covariates,
+            x_static_covariates,
+        ]
+        encoded = [t.flatten(start_dim=1) for t in encoded if t is not None]
+        encoded = torch.cat(encoded, dim=1)
 
-        return x_load
+        # encoder, decode, reshape
+        encoded = self.encoders(encoded)
+        decoded = self.decoders(encoded)
+
+        # get view that is batch size x output chunk length x self.decoder_output_dim x nr params
+        decoded = decoded.view(x.shape[0], self.output_chunk_length, -1)
+
+        # stack and temporally decode with future covariate last output steps
+        temporal_decoder_input = [
+            decoded,
+            (
+                x_dynamic_future_covariates[:, -self.output_chunk_length :, :]  # type: ignore
+                if self.future_cov_dim > 0
+                else None
+            ),
+        ]
+        temporal_decoder_input = [t for t in temporal_decoder_input if t is not None]
+
+        temporal_decoder_input = torch.cat(temporal_decoder_input, dim=2)
+        temporal_decoded = self.temporal_decoder(temporal_decoder_input)
+
+        # pass x_lookback through self.lookback_skip but swap the last two dimensions
+        # this is needed because the skip connection is applied across the input time steps
+        # and not across the output time steps
+        skip = self.lookback_skip(x_lookback.transpose(1, 2)).transpose(1, 2)
+
+        # add skip connection
+        y = temporal_decoded + skip.reshape_as(
+            temporal_decoded
+        )  # skip.view(temporal_decoded.shape)
+
+        # HEMS layer takes load (predicted_y), production (part of future covariates), tariff and soe (hardcoded for now)
+
+        production = x_future_covariates[:, :, :1]
+        tariff = x_future_covariates[:, :, 1:2]
+        load = y
+        inital_soe = torch.ones_like(load[:, 0, :])
+
+        y = self.hem_layer.layer(load, production, tariff, inital_soe)
+
+        y = y.view(-1, self.output_chunk_length, self.output_dim, self.nr_params)
+
+        return y
 
 
 class Model(MixedCovariatesTorchModel):
@@ -172,47 +382,75 @@ class Model(MixedCovariatesTorchModel):
         self,
         input_chunk_length: int,
         output_chunk_length: int,
-        shared_weights: bool = False,
-        const_init: bool = True,
-        normalize: bool = False,
+        output_chunk_shift: int = 0,
+        num_encoder_layers: int = 1,
+        num_decoder_layers: int = 1,
+        decoder_output_dim: int = 16,
+        hidden_size: int = 128,
+        temporal_width_past: int = 4,
+        temporal_width_future: int = 4,
+        temporal_decoder_hidden: int = 32,
+        use_layer_norm: bool = False,
+        dropout: float = 0.1,
         use_static_covariates: bool = True,
         **kwargs,
     ):
-        """The implementation of the NetLoad model, as presented in the paper.
+        """An implementation of the TiDE model, as presented in [1]_.
 
-        This implementation is improved by allowing the optional use of past covariates,
-        future covariates and static covariates, and by making the model optionally probabilistic.
+        TiDE is similar to Transformers (implemented in :class:`TransformerModel`),
+        but attempts to provide better performance at lower computational cost by introducing
+        multilayer perceptron (MLP)-based encoder-decoders without attention.
+
+        This model supports past covariates (known for `input_chunk_length` points before prediction time),
+        future covariates (known for `output_chunk_length` points after prediction time), static covariates,
+        as well as probabilistic forecasting.
+
+        The encoder and decoder are implemented as a series of residual blocks. The number of residual blocks in
+        the encoder and decoder can be controlled via ``num_encoder_layers`` and ``num_decoder_layers`` respectively.
+        The width of the layers in the residual blocks can be controlled via ``hidden_size``. Similarly, the width
+        of the layers in the temporal decoder can be controlled via ``temporal_decoder_hidden``.
 
         Parameters
         ----------
         input_chunk_length
-            The length of the input sequence fed to the model.
+            Number of time steps in the past to take as a model input (per chunk). Applies to the target
+            series, and past and/or future covariates (if the model supports it).
         output_chunk_length
-            The length of the forecast of the model.
-        shared_weights
-            Whether to use shared weights for all components of multivariate series.
-
-            .. warning::
-                When set to True, covariates will be ignored as a 1-to-1 mapping is
-                required between input dimensions and output dimensions.
-            ..
-
-            Default: False.
-
-        const_init
-            Whether to initialize the weights to 1/in_len. If False, the default PyTorch
-            initialization is used (default='True').
-        normalize
-            Whether to apply the simple "normalization" proposed in the paper, which consists
-            in subtracting the last value of the input sequence from the input sequence. Default: False.
-
-            .. note::
-                This cannot be applied to probabilistic models.
-            ..
-        use_static_covariates
-            Whether the model should use static covariate information in case the input `series` passed to ``fit()``
-            contain static covariates. If ``True``, and static covariates are available at fitting time, will enforce
-            that all target `series` have the same static covariate dimensionality in ``fit()`` and ``predict()``.
+            Number of time steps predicted at once (per chunk) by the internal model. Also, the number of future values
+            from future covariates to use as a model input (if the model supports future covariates). It is not the same
+            as forecast horizon `n` used in `predict()`, which is the desired number of prediction points generated
+            using either a one-shot- or autoregressive forecast. Setting `n <= output_chunk_length` prevents
+            auto-regression. This is useful when the covariates don't extend far enough into the future, or to prohibit
+            the model from using future values of past and / or future covariates for prediction (depending on the
+            model's covariate support).
+        output_chunk_shift
+            Optionally, the number of steps to shift the start of the output chunk into the future (relative to the
+            input chunk end). This will create a gap between the input and output. If the model supports
+            `future_covariates`, the future values are extracted from the shifted output chunk. Predictions will start
+            `output_chunk_shift` steps after the end of the target `series`. If `output_chunk_shift` is set, the model
+            cannot generate autoregressive predictions (`n > output_chunk_length`).
+        num_encoder_layers
+            The number of residual blocks in the encoder.
+        num_decoder_layers
+            The number of residual blocks in the decoder.
+        decoder_output_dim
+            The dimensionality of the output of the decoder.
+        hidden_size
+            The width of the layers in the residual blocks of the encoder and decoder.
+        temporal_width_past
+            The width of the layers in the past covariate projection residual block. If `0`,
+            will bypass feature projection and use the raw feature data.
+        temporal_width_future
+            The width of the layers in the future covariate projection residual block. If `0`,
+            will bypass feature projection and use the raw feature data.
+        temporal_decoder_hidden
+            The width of the layers in the temporal decoder.
+        use_layer_norm
+            Whether to use layer normalization in the residual blocks.
+        dropout
+            The dropout probability to be used in fully connected layers. This is compatible with Monte Carlo dropout
+            at inference time for model uncertainty estimation (enabled with ``mc_dropout=True`` at
+            prediction time).
         **kwargs
             Optional arguments to initialize the pytorch_lightning.Module, pytorch_lightning.Trainer, and
             Darts' :class:`TorchForecastingModel`.
@@ -238,6 +476,9 @@ class Model(MixedCovariatesTorchModel):
             to using a constant learning rate. Default: ``None``.
         lr_scheduler_kwargs
             Optionally, some keyword arguments for the PyTorch learning rate scheduler. Default: ``None``.
+        use_reversible_instance_norm
+            Whether to use reversible instance normalization `RINorm` against distribution shift as shown in [2]_.
+            It is only applied to the features of the target series and not the covariates.
         batch_size
             Number of time series (input and output sequences) used in each training pass. Default: ``32``.
         n_epochs
@@ -261,7 +502,7 @@ class Model(MixedCovariatesTorchModel):
             If set to ``True``, any previously-existing model with the same name will be reset (all checkpoints will
             be discarded). Default: ``False``.
         save_checkpoints
-            Whether or not to automatically save the untrained model and checkpoints from training.
+            Whether to automatically save the untrained model and checkpoints from training.
             To load the model from checkpoint, call :func:`MyModelClass.load_from_checkpoint()`, where
             :class:`MyModelClass` is the :class:`TorchForecastingModel` class that was used (such as :class:`TFTModel`,
             :class:`NBEATSModel`, etc.). If set to ``False``, the model can still be manually saved using
@@ -278,12 +519,16 @@ class Model(MixedCovariatesTorchModel):
             .. highlight:: python
             .. code-block:: python
 
+                def encode_year(idx):
+                    return (idx.year - 1950) / 50
+
                 add_encoders={
                     'cyclic': {'future': ['month']},
                     'datetime_attribute': {'future': ['hour', 'dayofweek']},
                     'position': {'past': ['relative'], 'future': ['relative']},
-                    'custom': {'past': [lambda idx: (idx.year - 1950) / 50]},
-                    'transformer': Scaler()
+                    'custom': {'past': [encode_year]},
+                    'transformer': Scaler(),
+                    'tz': 'CET'
                 }
             ..
         random_state
@@ -302,13 +547,14 @@ class Model(MixedCovariatesTorchModel):
             "devices", and "auto_select_gpus"``. Some examples for setting the devices inside the ``pl_trainer_kwargs``
             dict:
 
-                - ``{"accelerator": "cpu"}`` for CPU,
-                - ``{"accelerator": "gpu", "devices": [i]}`` to use only GPU ``i`` (``i`` must be an integer),
-                - ``{"accelerator": "gpu", "devices": -1, "auto_select_gpus": True}`` to use all available GPUS.
+            - ``{"accelerator": "cpu"}`` for CPU,
+            - ``{"accelerator": "gpu", "devices": [i]}`` to use only GPU ``i`` (``i`` must be an integer),
+            - ``{"accelerator": "gpu", "devices": -1, "auto_select_gpus": True}`` to use all available GPUS.
 
-                For more info, see here:
-                https://pytorch-lightning.readthedocs.io/en/stable/common/trainer.html#trainer-flags , and
-                https://pytorch-lightning.readthedocs.io/en/stable/accelerators/gpu_basic.html#train-on-multiple-gpus
+            For more info, see here:
+            https://pytorch-lightning.readthedocs.io/en/stable/common/trainer.html#trainer-flags , and
+            https://pytorch-lightning.readthedocs.io/en/stable/accelerators/gpu_basic.html#train-on-multiple-gpus
+
             With parameter ``"callbacks"`` you can add custom or PyTorch-Lightning built-in callbacks to Darts'
             :class:`TorchForecastingModel`. Below is an example for adding EarlyStopping to the training process.
             The model will stop training early if the validation loss `val_loss` does not improve beyond
@@ -339,50 +585,115 @@ class Model(MixedCovariatesTorchModel):
             whether to show warnings raised from PyTorch Lightning. Useful to detect potential issues of
             your forecasting use case. Default: ``False``.
 
+        References
+        ----------
+        .. [1] A. Das et al. "Long-term Forecasting with TiDE: Time-series Dense Encoder",
+                http://arxiv.org/abs/2304.08424
+        .. [2] T. Kim et al. "Reversible Instance Normalization for Accurate Time-Series Forecasting against
+                Distribution Shift", https://openreview.net/forum?id=cGDAkQo1C0p
 
+        Examples
+        --------
+        >>> from darts.datasets import WeatherDataset
+        >>> from darts.models import TiDEModel
+        >>> series = WeatherDataset().load()
+        >>> # predicting atmospheric pressure
+        >>> target = series['p (mbar)'][:100]
+        >>> # optionally, use past observed rainfall (pretending to be unknown beyond index 100)
+        >>> past_cov = series['rain (mm)'][:100]
+        >>> # optionally, use future temperatures (pretending this component is a forecast)
+        >>> future_cov = series['T (degC)'][:106]
+        >>> model = TiDEModel(
+        >>>     input_chunk_length=6,
+        >>>     output_chunk_length=6,
+        >>>     n_epochs=20
+        >>> )
+        >>> model.fit(target, past_covariates=past_cov, future_covariates=future_cov)
+        >>> pred = model.predict(6)
+        >>> pred.values()
+        array([[1008.1667634 ],
+               [ 997.08337201],
+               [1017.72035839],
+               [1005.10790392],
+               [ 998.90537286],
+               [1005.91534452]])
+
+        .. note::
+            `TiDE example notebook <https://unit8co.github.io/darts/examples/18-TiDE-examples.html>`_ presents
+            techniques that can be used to improve the forecasts quality compared to this simple usage example.
         """
+        if temporal_width_past < 0 or temporal_width_future < 0:
+            raise_log(
+                ValueError(
+                    "`temporal_width_past` and `temporal_width_future` must be >= 0."
+                ),
+                logger=logger,
+            )
         super().__init__(**self._extract_torch_model_params(**self.model_params))
 
         # extract pytorch lightning module kwargs
         self.pl_module_params = self._extract_pl_module_params(**self.model_params)
 
-        self.shared_weights = shared_weights
-        self.const_init = const_init
-        self.normalize = normalize
+        self.num_encoder_layers = num_encoder_layers
+        self.num_decoder_layers = num_decoder_layers
+        self.decoder_output_dim = decoder_output_dim
+        self.hidden_size = hidden_size
+        self.temporal_width_past = temporal_width_past
+        self.temporal_width_future = temporal_width_future
+        self.temporal_decoder_hidden = temporal_decoder_hidden
+
         self._considers_static_covariates = use_static_covariates
 
-        raise_if(
-            "likelihood" in self.model_params
-            and self.model_params["likelihood"] is not None
-            and self.normalize,
-            "normalize = True cannot be used with probabilistic NLinearModel",
+        self.use_layer_norm = use_layer_norm
+        self.dropout = dropout
+
+    def _create_model(
+        self, train_sample: MixedCovariatesTrainTensorType
+    ) -> torch.nn.Module:
+        (
+            past_target,
+            past_covariates,
+            historic_future_covariates,
+            future_covariates,
+            static_covariates,
+            future_target,
+        ) = train_sample
+
+        # target, past covariates, historic future covariates
+        input_dim = (
+            past_target.shape[1]
+            + (past_covariates.shape[1] if past_covariates is not None else 0)
+            + (
+                historic_future_covariates.shape[1]
+                if historic_future_covariates is not None
+                else 0
+            )
         )
 
-    def _create_model(self, train_sample: Tuple[torch.Tensor]) -> torch.nn.Module:
-        # samples are made of
-        # (past_target, past_covariates, historic_future_covariates,
-        #  future_covariates, static_covariates, future_target)
+        output_dim = future_target.shape[1]
 
-        raise_if(
-            self.shared_weights
-            and (train_sample[1] is not None or train_sample[2] is not None),
-            "Covariates have been provided, but the model has been built with shared_weights=True."
-            + "Please set shared_weights=False to use covariates.",
+        future_cov_dim = (
+            future_covariates.shape[1] if future_covariates is not None else 0
         )
-
-        input_dim = train_sample[0].shape[1] + sum(
-            # add past covariates dim and historic future covariates dim, if present
-            train_sample[i].shape[1] if train_sample[i] is not None else 0
-            for i in (1, 2)
+        static_cov_dim = (
+            static_covariates.shape[0] * static_covariates.shape[1]
+            if static_covariates is not None
+            else 0
         )
-        future_cov_dim = train_sample[3].shape[1] if train_sample[3] is not None else 0
-
-        # dimension is (component, static_dim), we extract static_dim
-        static_cov_dim = train_sample[4].shape[1] if train_sample[4] is not None else 0
-
-        output_dim = train_sample[-1].shape[1]
 
         nr_params = 1 if self.likelihood is None else self.likelihood.num_parameters
+
+        past_cov_dim = input_dim - output_dim - future_cov_dim
+        if past_cov_dim and self.temporal_width_past >= past_cov_dim:
+            logger.warning(
+                f"number of `past_covariates` features is <= `temporal_width_past`, leading to feature expansion."
+                f"number of covariates: {past_cov_dim}, `temporal_width_past={self.temporal_width_past}`."
+            )
+        if future_cov_dim and self.temporal_width_future >= future_cov_dim:
+            logger.warning(
+                f"number of `future_covariates` features is <= `temporal_width_future`, leading to feature expansion."
+                f"number of covariates: {future_cov_dim}, `temporal_width_future={self.temporal_width_future}`."
+            )
 
         return Module(
             input_dim=input_dim,
@@ -390,69 +701,62 @@ class Model(MixedCovariatesTorchModel):
             future_cov_dim=future_cov_dim,
             static_cov_dim=static_cov_dim,
             nr_params=nr_params,
-            shared_weights=self.shared_weights,
-            const_init=self.const_init,
-            normalize=self.normalize,
+            num_encoder_layers=self.num_encoder_layers,
+            num_decoder_layers=self.num_decoder_layers,
+            decoder_output_dim=self.decoder_output_dim,
+            hidden_size=self.hidden_size,
+            temporal_width_past=self.temporal_width_past,
+            temporal_width_future=self.temporal_width_future,
+            temporal_decoder_hidden=self.temporal_decoder_hidden,
+            use_layer_norm=self.use_layer_norm,
+            dropout=self.dropout,
+            hem_layer=HomeEnergyManager(3, 10, 5, 0.25),
             **self.pl_module_params,
         )
-
-    @property
-    def supports_multivariate(self) -> bool:
-        return True
 
     @property
     def supports_static_covariates(self) -> bool:
         return True
 
     @property
-    def supports_future_covariates(self) -> bool:
-        return not self.shared_weights
-
-    @property
-    def supports_past_covariates(self) -> bool:
-        return not self.shared_weights
+    def supports_multivariate(self) -> bool:
+        return True
 
 
 if __name__ == "__main__":
-    PATCH_SIZE = 10
-    SAMPLE_COUNT = 100
+    import pandas as pd
 
-    assert (
-        SAMPLE_COUNT % PATCH_SIZE == 0
-    ), "SAMPLE_COUNT must be a multiple of PATCH_SIZE"
+    from darts import TimeSeries
 
     df_netload = pd.read_hdf(
         os.path.join(ROOT_PATH, "data", "clean_data", "data_net_load_forecasting.h5"),
-        key="1min/netload",
+        key="15min/netload",
     )
 
-    df_pv = (
-        pd.read_hdf(
-            os.path.join(
-                ROOT_PATH, "data", "clean_data", "data_net_load_forecasting.h5"
-            ),
-            key="1min/community_pv",
-        )
-        * -1
+    df_pv = pd.read_hdf(
+        os.path.join(ROOT_PATH, "data", "clean_data", "data_net_load_forecasting.h5"),
+        key="15min/community_pv",
     )
 
-    df = pd.concat([df_netload, df_pv], axis=1)[:SAMPLE_COUNT]
+    df = pd.concat([df_netload, df_pv], axis=1)[:192]
+    df["tariff"] = 0.0
+    df["tariff"][20:40] = 0.5
+    df["tariff"][60:80] = 0.5
 
-    trg = df.iloc[:, 0].values.reshape(-1, PATCH_SIZE)
-    cov = df.iloc[:, 1].values.reshape(-1, PATCH_SIZE)
-    ts_idx = df.index[::PATCH_SIZE]
-    df_trg = pd.DataFrame(trg, index=ts_idx)
-    df_cov = pd.DataFrame(cov, index=ts_idx)
+    df = df.astype("float32")
 
-    ts_trg = TimeSeries.from_dataframe(df_trg)
-    ts_cov = TimeSeries.from_dataframe(df_cov)
+    ts_trg = TimeSeries.from_dataframe(df[["net_community_load"]], freq="15min")
+    ts_cov = TimeSeries.from_dataframe(df[["community_pv", "tariff"]], freq="15min")
+
+    encoders = {"datetime_attribute": {"future": ["hour", "dayofweek"]}}
 
     model = Model(
-        input_chunk_length=4,
-        output_chunk_length=6,
+        input_chunk_length=1,
+        output_chunk_length=3,
         n_epochs=1,
         random_state=0,
         batch_size=1,
+        add_encoders=encoders,
     )
 
     model.fit(ts_trg, future_covariates=ts_cov)
